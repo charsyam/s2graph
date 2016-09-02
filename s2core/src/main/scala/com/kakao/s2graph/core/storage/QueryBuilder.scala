@@ -14,79 +14,91 @@ abstract class QueryBuilder[R, T](storage: Storage)(implicit ec: ExecutionContex
 
   def getEdge(srcVertex: Vertex, tgtVertex: Vertex, queryParam: QueryParam, isInnerCall: Boolean): T
 
-  def fetch(queryRequest: QueryRequest): T
+  def fetch(queryRequest: QueryRequest,
+            prevStepScore: Double,
+            isInnerCall: Boolean,
+            parentEdges: Seq[EdgeWithScore]): T
 
   def toCacheKeyBytes(request: R): Array[Byte]
 
-  def fetches(queryRequests: Seq[QueryRequest],
-              prevStepEdges: Map[VertexId, Seq[EdgeWithScore]]): Future[Seq[QueryResult]]
+  def fetches(queryRequestWithScoreLs: Seq[(QueryRequest, Double)],
+              prevStepEdges: Map[VertexId, Seq[EdgeWithScore]]): Future[Seq[QueryRequestWithResult]]
 
 
-  def fetchStep(queryResultsLs: Seq[QueryResult],
-                q: Query,
-                stepIdx: Int): Future[Seq[QueryResult]] = {
+  def fetchStep(queryRequestWithResultsLs: Seq[QueryRequestWithResult]): Future[Seq[QueryRequestWithResult]] = {
+    if (queryRequestWithResultsLs.isEmpty) Future.successful(Nil)
+    else {
+      val queryRequest = queryRequestWithResultsLs.head.queryRequest
+      val q = queryRequest.query
+      val queryResultsLs = queryRequestWithResultsLs.map(_.queryResult)
 
-    val prevStepOpt = if (stepIdx > 0) Option(q.steps(stepIdx - 1)) else None
-    val prevStepThreshold = prevStepOpt.map(_.nextStepScoreThreshold).getOrElse(QueryParam.DefaultThreshold)
-    val prevStepLimit = prevStepOpt.map(_.nextStepLimit).getOrElse(-1)
-    val step = q.steps(stepIdx)
-    val alreadyVisited =
-      if (stepIdx == 0) Map.empty[(LabelWithDirection, Vertex), Boolean]
-      else Graph.alreadyVisitedVertices(queryResultsLs)
+      val stepIdx = queryRequest.stepIdx + 1
 
-    val groupedBy = queryResultsLs.flatMap { queryResult =>
-      queryResult.edgeWithScoreLs.map { case edgeWithScore =>
-        edgeWithScore.edge.tgtVertex -> edgeWithScore
+      val prevStepOpt = if (stepIdx > 0) Option(q.steps(stepIdx - 1)) else None
+      val prevStepThreshold = prevStepOpt.map(_.nextStepScoreThreshold).getOrElse(QueryParam.DefaultThreshold)
+      val prevStepLimit = prevStepOpt.map(_.nextStepLimit).getOrElse(-1)
+      val step = q.steps(stepIdx)
+      val alreadyVisited =
+        if (stepIdx == 0) Map.empty[(LabelWithDirection, Vertex), Boolean]
+        else Graph.alreadyVisitedVertices(queryResultsLs)
+
+      val groupedBy = queryResultsLs.flatMap { queryResult =>
+        queryResult.edgeWithScoreLs.map { case edgeWithScore =>
+          edgeWithScore.edge.tgtVertex -> edgeWithScore
+        }
+      }.groupBy { case (vertex, edgeWithScore) => vertex }
+
+      val groupedByFiltered = for {
+        (vertex, edgesWithScore) <- groupedBy
+        aggregatedScore = edgesWithScore.map(_._2.score).sum if aggregatedScore >= prevStepThreshold
+      } yield vertex -> aggregatedScore
+
+      val prevStepTgtVertexIdEdges = for {
+        (vertex, edgesWithScore) <- groupedBy
+      } yield vertex.id -> edgesWithScore.map { case (vertex, edgeWithScore) => edgeWithScore }
+
+      val nextStepSrcVertices = if (prevStepLimit >= 0) {
+        groupedByFiltered.toSeq.sortBy(-1 * _._2).take(prevStepLimit)
+      } else {
+        groupedByFiltered.toSeq
       }
-    }.groupBy { case (vertex, edgeWithScore) => vertex }
 
-    val groupedByFiltered = for {
-      (vertex, edgesWithScore) <- groupedBy
-      aggregatedScore = edgesWithScore.map(_._2.score).sum if aggregatedScore >= prevStepThreshold
-    } yield vertex -> aggregatedScore
+      val queryRequests = for {
+        (vertex, prevStepScore) <- nextStepSrcVertices
+        queryParam <- step.queryParams
+      } yield (QueryRequest(q, stepIdx, vertex, queryParam), prevStepScore)
 
-    val prevStepTgtVertexIdEdges = for {
-      (vertex, edgesWithScore) <- groupedBy
-    } yield vertex.id -> edgesWithScore.map { case (vertex, edgeWithScore) => edgeWithScore }
-
-    val nextStepSrcVertices = if (prevStepLimit >= 0) {
-      groupedByFiltered.toSeq.sortBy(-1 * _._2).take(prevStepLimit)
-    } else {
-      groupedByFiltered.toSeq
+      Graph.filterEdges(fetches(queryRequests, prevStepTgtVertexIdEdges), alreadyVisited)(ec)
     }
-
-    val queryRequests = for {
-      (vertex, prevStepScore) <- nextStepSrcVertices
-      queryParam <- step.queryParams
-    } yield QueryRequest(q, stepIdx, vertex, queryParam, prevStepScore, None, Nil, isInnerCall = false)
-
-    Graph.filterEdges(fetches(queryRequests, prevStepTgtVertexIdEdges), q, stepIdx, alreadyVisited)(ec)
   }
 
-  def fetchStepFuture(queryResultLsFuture: Future[Seq[QueryResult]],
-                      q: Query,
-                      stepIdx: Int): Future[Seq[QueryResult]] = {
+  def fetchStepFuture(queryRequestWithResultLsFuture: Future[Seq[QueryRequestWithResult]]): Future[Seq[QueryRequestWithResult]] = {
     for {
-      queryResultLs <- queryResultLsFuture
-      ret <- fetchStep(queryResultLs, q, stepIdx)
+      queryRequestWithResultLs <- queryRequestWithResultLsFuture
+      ret <- fetchStep(queryRequestWithResultLs)
     } yield ret
   }
 
-  def getEdges(q: Query): Future[Seq[QueryResult]] = {
+  def getEdges(q: Query): Future[Seq[QueryRequestWithResult]] = {
+    val fallback = {
+      val queryRequest = QueryRequest(query = q, stepIdx = 0, q.vertices.head, queryParam = QueryParam.Empty)
+      Future.successful(q.vertices.map(v => QueryRequestWithResult(queryRequest, QueryResult())))
+    }
     Try {
       if (q.steps.isEmpty) {
         // TODO: this should be get vertex query.
-        Future.successful(q.vertices.map(v => QueryResult(query = q, stepIdx = 0, queryParam = QueryParam.Empty)))
+        fallback
       } else {
+        // current stepIdx = -1
         val startQueryResultLs = QueryResult.fromVertices(q)
-        q.steps.zipWithIndex.foldLeft(Future.successful(startQueryResultLs)) { case (acc, (_, idx)) =>
-          fetchStepFuture(acc, q, idx)
+        q.steps.foldLeft(Future.successful(startQueryResultLs)) { case (acc, step) =>
+          fetchStepFuture(acc)
         }
       }
     } recover {
       case e: Exception =>
         logger.error(s"getEdgesAsync: $e", e)
-        Future.successful(q.vertices.map(v => QueryResult(query = q, stepIdx = 0, queryParam = QueryParam.Empty)))
+        fallback
     } get
   }
 }

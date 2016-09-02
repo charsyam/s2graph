@@ -3,6 +3,7 @@ package com.kakao.s2graph.core.storage
 import com.google.common.cache.Cache
 import com.kakao.s2graph.core._
 import com.kakao.s2graph.core.mysqls.Label
+import com.kakao.s2graph.core.utils.logger
 
 
 import scala.collection.Seq
@@ -28,9 +29,9 @@ abstract class Storage(implicit ec: ExecutionContext) {
   def vertexDeserializer: StorageDeserializable[Vertex]
 
   // Interface
-  def getEdges(q: Query): Future[Seq[QueryResult]]
+  def getEdges(q: Query): Future[Seq[QueryRequestWithResult]]
 
-  def checkEdges(params: Seq[(Vertex, Vertex, QueryParam)]): Future[Seq[QueryResult]]
+  def checkEdges(params: Seq[(Vertex, Vertex, QueryParam)]): Future[Seq[QueryRequestWithResult]]
 
   def getVertices(vertices: Seq[Vertex]): Future[Seq[Vertex]]
 
@@ -71,8 +72,15 @@ abstract class Storage(implicit ec: ExecutionContext) {
                               queryParam: QueryParam,
                               cacheElementOpt: Option[IndexEdge],
                               parentEdges: Seq[EdgeWithScore]): Option[Edge] = {
-    val indexEdge = indexEdgeDeserializer.fromKeyValues(queryParam, Seq(kv), queryParam.label.schemaVersion, cacheElementOpt)
-    Option(indexEdge.toEdge.copy(parentEdges = parentEdges))
+    try {
+      val indexEdge = indexEdgeDeserializer.fromKeyValues(queryParam, Seq(kv), queryParam.label.schemaVersion, cacheElementOpt)
+
+      Option(indexEdge.toEdge.copy(parentEdges = parentEdges))
+    } catch {
+      case ex: Exception =>
+        logger.error(s"Fail on toEdge: ${kv.toString}, ${queryParam}")
+        None
+    }
   }
 
   def toSnapshotEdge[K: CanSKeyValue](kv: K,
